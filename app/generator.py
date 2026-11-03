@@ -83,10 +83,16 @@ def normalize(data: dict) -> dict:
     commercial = data.get("commercial") if isinstance(data.get("commercial"), dict) else {}
     description = data.get("seo_description") if isinstance(data.get("seo_description"), str) else ""
     paragraphs = [" ".join(p.split()) for p in re.split(r"\n\s*\n|\\n\\n", description) if p.strip()]
+    title = _one_line(data.get("seo_title", ""))
+    queries = []
+    for q in _items(data.get("search_queries")):
+        q = q.lower()
+        if q not in queries:
+            queries.append(q)
     return {
-        "seo_title": _one_line(data.get("seo_title", "")),
+        "seo_title": title[:1].upper() + title[1:],
         "seo_description": "\n\n".join(paragraphs),
-        "search_queries": _items(data.get("search_queries")),
+        "search_queries": queries,
         "commercial": {
             "for_whom": _one_line(commercial.get("for_whom", "")),
             "tasks": _items(commercial.get("tasks")),
@@ -105,7 +111,7 @@ def _generated_fields(card: dict) -> list[tuple[str, str]]:
     return fields
 
 
-def find_problems(card: dict, source: str) -> list[str]:
+def find_problems(card: dict, source: str, sparse: bool = False) -> list[str]:
     problems = []
     title_len = len(card["seo_title"])
     if not title_len:
@@ -114,7 +120,7 @@ def find_problems(card: dict, source: str) -> list[str]:
         problems.append(f"seo_title — {title_len} символов, нужно не больше {TITLE_MAX}. Сократи, сохранив тип прибора и модель.")
 
     desc_len = len(card["seo_description"])
-    if desc_len < DESCRIPTION_MIN:
+    if desc_len < DESCRIPTION_MIN and not sparse:
         problems.append(
             f"seo_description — {desc_len} символов, нужно {DESCRIPTION_MIN}–{DESCRIPTION_MAX}. "
             "Подробнее раскрой то, что уже есть в данных (назначение, конструкция, условия эксплуатации), без новых фактов."
@@ -226,13 +232,16 @@ def build_characteristics(product: Product) -> list[dict]:
     return rows
 
 
-def _dedupe(items: list[str]) -> list[str]:
-    seen, out = set(), []
-    for item in items:
+def _clarifications(product_issues: list[str], model_items: list[str]) -> list[str]:
+    """Замечания по входным данным + пункты модели, которые их не повторяют."""
+    out = list(product_issues)
+    known = " ".join(product_issues).lower()
+    seen = set()
+    for item in model_items:
         key = item.lower().strip(" .")
-        if key and key not in seen:
+        if key and key not in seen and key not in known:
             seen.add(key)
-            out.append(item)
+            out.append(item[:1].upper() + item[1:])
     return out
 
 
@@ -244,6 +253,7 @@ def generate_card(product: Product, client: ChatClient, max_repairs: int = MAX_R
     ]
     card: dict | None = None
     problems: list[str] = []
+    repair_log: list[list[str]] = []
     attempts = 0
 
     for attempt in range(max_repairs + 1):
@@ -251,9 +261,10 @@ def generate_card(product: Product, client: ChatClient, max_repairs: int = MAX_R
         reply = client.chat(messages)
         try:
             card = normalize(parse_json_reply(reply))
-            problems = find_problems(card, source)
+            problems = find_problems(card, source, sparse=product.is_sparse)
         except ValueError as exc:  # json.JSONDecodeError — подкласс ValueError
             problems = [f"Ответ не является корректным JSON ({exc}). Верни только JSON-объект по схеме."]
+        repair_log.append(problems)
         if not problems:
             break
         if attempt < max_repairs:
@@ -276,11 +287,12 @@ def generate_card(product: Product, client: ChatClient, max_repairs: int = MAX_R
         characteristics=build_characteristics(product),
         search_queries=card["search_queries"],
         commercial=card["commercial"],
-        needs_clarification=_dedupe(product.issues + card["missing_or_unclear"]),
+        needs_clarification=_clarifications(product.issues, card["missing_or_unclear"]),
         warnings=warnings,
         meta={
             "model": client.model,
             "attempts": attempts,
+            "checks_per_attempt": repair_log,
             "fact_check": "пройдена" if not warnings else "есть замечания, см. warnings",
             "device_type": product.device_type,
             "title_length": len(card["seo_title"]),

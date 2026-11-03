@@ -32,6 +32,15 @@ class Product:
     missing_specs: list[str] = field(default_factory=list)  # из чек-листа типа, но нет в данных
     empty_specs: list[str] = field(default_factory=list)  # переданы во входных данных без значения
 
+    @property
+    def is_sparse(self) -> bool:
+        """Мало фактов: нет развёрнутого описания и меньше 6 характеристик.
+
+        В этом случае модель не просят «дотягивать» описание до 800 символов —
+        иначе она заполнит объём общими фразами.
+        """
+        return len(self.description) < 300 and len(self.specs) < 6
+
     def facts(self) -> dict[str, Any]:
         """Данные, которые передаются в модель как единственный источник фактов."""
         data: dict[str, Any] = {

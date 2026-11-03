@@ -115,3 +115,34 @@ def test_sensor_example_passes_with_grounded_reply(sensor):
     }
     card = generate_card(sensor, FakeClient(reply))
     assert card.warnings == []
+
+
+def test_sparse_product_is_not_padded():
+    product = parse_product({"name": "Манометр ТМ-210Р", "manufacturer": "РОСМА",
+                             "specs": {"диапазон измерений": "0–2,5 МПа"}})
+    assert product.is_sparse
+    reply = {
+        "seo_title": "манометр ТМ-210Р РОСМА 0–2,5 МПа",
+        "seo_description": "Манометр ТМ-210Р производства РОСМА, диапазон измерений 0–2,5 МПа.",
+        "search_queries": ["Манометр ТМ-210Р", "манометр росма", "манометр 0–2,5 мпа"],
+        "commercial": {"for_whom": NO_APPLICATION, "tasks": ["Измерение давления 0–2,5 МПа"], "selling_points": []},
+        "missing_or_unclear": ["диаметр корпуса", "Нет паспорта прибора"],
+    }
+    client = FakeClient(reply)
+    card = generate_card(product, client)
+    assert len(client.calls) == 1  # короткое описание не отправляется на «дописывание»
+    assert "Данных о товаре мало" in client.calls[0][1]["content"]
+    assert card.seo_title.startswith("Манометр")  # заглавная буква
+    assert card.search_queries[0] == "манометр тм-210р"  # нижний регистр
+    # «диаметр корпуса» уже есть в замечаниях по входным данным — не дублируется
+    assert sum("иаметр корпуса" in item for item in card.needs_clarification) == 1
+    assert "Нет паспорта прибора" in card.needs_clarification
+    assert card.meta["checks_per_attempt"] == [[]]
+
+
+def test_rich_product_short_description_is_repaired(manometer):
+    short = good_reply(manometer, seo_description="Манометр ТМ-510Р М2 производства РОСМА.")
+    client = FakeClient(short, good_reply(manometer))
+    card = generate_card(manometer, client)
+    assert "seo_description" in client.calls[1][-1]["content"]
+    assert len(card.meta["checks_per_attempt"]) == 2 and card.meta["checks_per_attempt"][1] == []
