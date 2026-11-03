@@ -32,6 +32,7 @@ class Settings:
     max_retries: int = 2
     json_mode: bool = True
     auth_scheme: str = "Bearer"  # Yandex AI Studio принимает и "Api-Key"
+    verify: bool = True  # второй проход: модель-фактчекер сверяет утверждения без чисел
     extra_headers: dict = field(default_factory=dict)
 
 
@@ -50,5 +51,6 @@ def get_settings() -> Settings:
         max_retries=_int("LLM_MAX_RETRIES", Settings.max_retries),
         json_mode=os.getenv("LLM_JSON_MODE", "1").strip() == "1",
         auth_scheme=os.getenv("LLM_AUTH_SCHEME", "Bearer").strip() or "Bearer",
+        verify=os.getenv("LLM_VERIFY", "1").strip() == "1",
         extra_headers=headers,
     )

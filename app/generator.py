@@ -13,6 +13,7 @@ from typing import Protocol
 
 from .grounding import check_text
 from .input_check import Product
+from .llm import LLMError
 from .prompts import (
     DESCRIPTION_MAX,
     DESCRIPTION_MIN,
@@ -20,8 +21,10 @@ from .prompts import (
     QUERIES_MIN,
     SYSTEM_PROMPT,
     TITLE_MAX,
+    VERIFY_SYSTEM_PROMPT,
     build_repair_prompt,
     build_user_prompt,
+    build_verify_prompt,
 )
 
 NO_DATA = "данных нет"
@@ -89,15 +92,50 @@ META_RE = re.compile(
 )
 
 
-def unwrap(data: dict) -> dict:
-    """Некоторые модели оборачивают ответ: {"card": {...}}. Достаём вложенный объект."""
-    if any(k in data for k in EXPECTED_KEYS):
-        return data
-    for value in data.values():
-        if isinstance(value, dict) and any(k in value for k in EXPECTED_KEYS):
-            return value
-    keys = ", ".join(list(data)[:8]) or "нет"
-    raise ValueError(f"нет ключей seo_title, seo_description, search_queries, commercial; получены ключи: {keys}")
+TOP_KEYS = [("seo_title", str), ("seo_description", str), ("search_queries", list),
+            ("commercial", dict), ("missing_or_unclear", list)]
+COMMERCIAL_KEYS = [("for_whom", str), ("tasks", list), ("selling_points", list)]
+
+
+def repair_keys(obj: dict, order: list[tuple[str, type]]) -> tuple[dict, list[str]]:
+    """Восстанавливает имена ключей, которые модель потеряла.
+
+    На реальных ответах Alice AI встречалось `{"seo_title": "...", ",": "<описание>"}`:
+    вместо имени ключа — знак препинания. Такой ключ сопоставляем с первым недостающим
+    ключом схемы того же типа (порядок ключей в ответе совпадает со схемой).
+    """
+    missing = [name for name, _ in order if name not in obj]
+    fixed: dict = {}
+    repaired: list[str] = []
+    for key, value in obj.items():
+        if re.search(r"\w", str(key)) or not missing:
+            fixed[key] = value
+            continue
+        target = next((name for name, kind in order if name in missing and isinstance(value, kind)), None)
+        if target:
+            fixed[target] = value
+            missing.remove(target)
+            repaired.append(target)
+        else:
+            fixed[key] = value
+    return fixed, repaired
+
+
+def unwrap(data: dict) -> tuple[dict, list[str]]:
+    """Приводит ответ к схеме: снимает обёртку {"card": {...}} и чинит потерянные имена ключей."""
+    data, repaired = repair_keys(data, TOP_KEYS)
+    if not any(k in data for k in EXPECTED_KEYS):
+        for value in data.values():
+            if isinstance(value, dict) and any(k in value for k in EXPECTED_KEYS):
+                data, repaired = repair_keys(value, TOP_KEYS)
+                break
+        else:
+            keys = ", ".join(list(data)[:8]) or "нет"
+            raise ValueError(f"нет ключей seo_title, seo_description, search_queries, commercial; получены ключи: {keys}")
+    if isinstance(data.get("commercial"), dict):
+        data["commercial"], fixed = repair_keys(data["commercial"], COMMERCIAL_KEYS)
+        repaired += [f"commercial.{k}" for k in fixed]
+    return data, repaired
 
 
 def normalize(data: dict) -> dict:
@@ -193,8 +231,60 @@ def _cut_sentences(text: str, limit: int) -> str:
     return head[: end + 1] if end > limit // 2 else _cut_words(text, limit)
 
 
-def enforce(card: dict, product: Product, warnings: list[str]) -> dict:
+def _sentences(paragraph: str) -> list[str]:
+    return [s for s in re.split(r"(?<=[.!?…])\s+", paragraph) if s.strip()]
+
+
+def collect_statements(card: dict) -> list[str]:
+    """Утверждения для проверки моделью-фактчекером: предложения описания и блок менеджера."""
+    statements = [s for p in card["seo_description"].split("\n\n") for s in _sentences(p)]
+    for_whom = card["commercial"]["for_whom"]
+    if for_whom and for_whom != NO_APPLICATION:
+        statements.append(for_whom)
+    return statements + card["commercial"]["tasks"] + card["commercial"]["selling_points"]
+
+
+def verify_statements(product: Product, card: dict, client: "ChatClient") -> tuple[dict[str, str], str | None]:
+    """Второй уровень защиты: модель сверяет утверждения без чисел с данными о товаре.
+
+    Возвращает {утверждение: причина} и текст замечания, если проверку выполнить не удалось.
+    """
+    statements = collect_statements(card)
+    if not statements:
+        return {}, None
+    try:
+        reply = client.chat([
+            {"role": "system", "content": VERIFY_SYSTEM_PROMPT},
+            {"role": "user", "content": build_verify_prompt(product, statements)},
+        ])
+        data = parse_json_reply(reply)
+    except (LLMError, ValueError) as exc:
+        return {}, f"Проверка утверждений моделью не выполнена ({exc}); проверьте блок для менеджера вручную."
+    found: dict[str, str] = {}
+    items = data.get("unsupported", [])
+    for item in items if isinstance(items, list) else []:
+        raw_id = item.get("id") if isinstance(item, dict) else item
+        reason = _one_line(item.get("reason", "")) if isinstance(item, dict) else ""
+        try:
+            idx = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= idx <= len(statements):
+            found[statements[idx - 1]] = reason
+    return found, None
+
+
+def enforce(card: dict, product: Product, warnings: list[str], unsupported: dict[str, str] | None = None) -> dict:
     source = product.source_text()
+    unsupported = unsupported or {}
+
+    def problem(text: str) -> str | None:
+        if _unverified(text, source):
+            return "данные, которых нет во входных"
+        if text in unsupported:
+            reason = unsupported[text]
+            return "утверждение не подтверждается данными" + (f": {reason}" if reason else "")
+        return None
 
     if not card["seo_title"] or _unverified(card["seo_title"], source):
         if card["seo_title"]:
@@ -206,11 +296,11 @@ def enforce(card: dict, product: Product, warnings: list[str]) -> dict:
 
     kept_paragraphs = []
     for paragraph in card["seo_description"].split("\n\n"):
-        sentences = re.split(r"(?<=[.!?…])\s+", paragraph)
         kept = []
-        for sentence in sentences:
-            if _unverified(sentence, source):
-                warnings.append(f"Из описания удалена фраза с данными, которых нет во входных: «{sentence}»")
+        for sentence in _sentences(paragraph):
+            reason = problem(sentence)
+            if reason:
+                warnings.append(f"Из описания удалена фраза ({reason}): «{sentence}»")
             elif META_RE.search(sentence):
                 warnings.append(f"Из описания удалена служебная фраза об отсутствии данных: «{sentence}»")
             else:
@@ -237,15 +327,19 @@ def enforce(card: dict, product: Product, warnings: list[str]) -> dict:
         warnings.append(f"Поисковых запросов меньше {QUERIES_MIN} — добавьте вручную.")
 
     commercial = card["commercial"]
-    if not commercial["for_whom"] or _unverified(commercial["for_whom"], source):
+    reason = problem(commercial["for_whom"]) if commercial["for_whom"] else "пусто"
+    if reason:
         if commercial["for_whom"]:
-            warnings.append(f"Блок «Кому подходит» содержал непроверенные данные и заменён: «{commercial['for_whom']}».")
+            warnings.append(f"Блок «Кому подходит» заменён ({reason}): «{commercial['for_whom']}».")
         commercial["for_whom"] = NO_APPLICATION
     for key in ("tasks", "selling_points"):
-        clean = [t for t in commercial[key] if not _unverified(t, source)]
-        for t in commercial[key]:
-            if t not in clean:
-                warnings.append(f"Из блока для менеджера удалён пункт с непроверенными данными: «{t}».")
+        clean = []
+        for item in commercial[key]:
+            reason = problem(item)
+            if reason:
+                warnings.append(f"Из блока для менеджера удалён пункт ({reason}): «{item}».")
+            else:
+                clean.append(item)
         commercial[key] = clean
     return card
 
@@ -273,10 +367,27 @@ def _clarifications(product_issues: list[str], model_items: list[str]) -> list[s
     return out
 
 
+def _ask(client: ChatClient, messages: list[dict], product: Product, raw_replies: list[str],
+         keys_repaired: list[str]) -> tuple[dict | None, list[str], str]:
+    """Один запрос к модели: ответ → карточка и список проблем."""
+    reply = client.chat(messages)
+    raw_replies.append(reply[:4000])
+    try:
+        data, repaired = unwrap(parse_json_reply(reply))
+    except ValueError as exc:  # json.JSONDecodeError — подкласс ValueError
+        return None, [f"Ответ не соответствует формату ({exc}). Верни только JSON-объект строго по схеме."], reply
+    keys_repaired += repaired
+    card = normalize(data)
+    return card, find_problems(card, product.source_text(), sparse=product.is_sparse), reply
+
+
 def generate_card(
-    product: Product, client: ChatClient, max_repairs: int = MAX_REPAIRS, keep_raw: bool = False
+    product: Product,
+    client: ChatClient,
+    max_repairs: int = MAX_REPAIRS,
+    keep_raw: bool = False,
+    verify: bool = False,
 ) -> Card:
-    source = product.source_text()
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": build_user_prompt(product)},
@@ -284,19 +395,15 @@ def generate_card(
     best: tuple[dict, list[str]] | None = None  # ответ с наименьшим числом проблем
     repair_log: list[list[str]] = []
     raw_replies: list[str] = []
+    keys_repaired: list[str] = []
     attempts = 0
 
+    # 1. Генерация и исправление по детерминированным проверкам
     for attempt in range(max_repairs + 1):
         attempts += 1
-        reply = client.chat(messages)
-        raw_replies.append(reply[:4000])
-        try:
-            card = normalize(unwrap(parse_json_reply(reply)))
-            problems = find_problems(card, source, sparse=product.is_sparse)
-            if best is None or len(problems) < len(best[1]):
-                best = (card, problems)
-        except ValueError as exc:  # json.JSONDecodeError — подкласс ValueError
-            problems = [f"Ответ не соответствует формату ({exc}). Верни только JSON-объект строго по схеме."]
+        card, problems, reply = _ask(client, messages, product, raw_replies, keys_repaired)
+        if card is not None and (best is None or len(problems) < len(best[1])):
+            best = (card, problems)
         repair_log.append(problems)
         if not problems:
             break
@@ -308,10 +415,42 @@ def generate_card(
 
     if best is None:
         raise GenerationError(f"Модель не вернула корректный JSON по схеме за {attempts} попыток.")
+    card = best[0]
 
-    warnings: list[str] = []
-    card = enforce(best[0], product, warnings)
+    # 2. Проверка утверждений без чисел моделью-фактчекером + одно исправление
+    unsupported: dict[str, str] = {}
+    claims_log: list[dict] = []
+    notes: list[str] = []
+    if verify:
+        unsupported, note = verify_statements(product, card, client)
+        claims_log.append({"checked": len(collect_statements(card)), "unsupported": unsupported})
+        if note:
+            notes.append(note)
+        if unsupported:
+            attempts += 1
+            fix = [f"Утверждение «{s}» не подтверждается данными ({r or 'нет в данных'}) — убери его или перепиши строго по данным."
+                   for s, r in unsupported.items()]
+            retry = messages + [
+                {"role": "assistant", "content": json.dumps(card, ensure_ascii=False)},
+                {"role": "user", "content": build_repair_prompt(fix)},
+            ]
+            new_card, new_problems, _ = _ask(client, retry, product, raw_replies, keys_repaired)
+            repair_log.append(new_problems)
+            if new_card is not None and len(new_problems) <= len(best[1]):
+                card = new_card
+                unsupported, note = verify_statements(product, card, client)
+                claims_log.append({"checked": len(collect_statements(card)), "unsupported": unsupported})
+                if note:
+                    notes.append(note)
+
+    # 3. Страховка: всё непроверенное удаляется с замечанием
+    warnings: list[str] = list(notes)
+    card = enforce(card, product, warnings, unsupported)
     extra_meta = {"raw_replies": raw_replies} if keep_raw else {}
+    if keys_repaired:
+        extra_meta["keys_repaired"] = keys_repaired
+    if verify:
+        extra_meta["claims_check"] = claims_log
 
     return Card(
         name=product.name,

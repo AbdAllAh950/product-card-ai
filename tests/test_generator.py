@@ -183,3 +183,53 @@ def test_unsupported_evaluations_are_flagged(manometer):
     card = generate_card(manometer, FakeClient(reply))
     assert card.commercial["selling_points"] == []
     assert any("удалён пункт" in w for w in card.warnings)
+
+
+def test_lost_key_names_are_restored(manometer):
+    reply = good_reply(manometer)
+    raw = {"seo_title": reply["seo_title"], ",": reply["seo_description"], "search_queries": reply["search_queries"],
+           "commercial": {", ": "Предприятиям, обслуживающим объекты ЖКХ.", "tasks": reply["commercial"]["tasks"],
+                          "selling_points": reply["commercial"]["selling_points"]}}
+    client = FakeClient(raw)
+    card = generate_card(manometer, client)
+    assert len(client.calls) == 1  # без лишнего повторного запроса
+    assert card.seo_description == reply["seo_description"]
+    assert card.commercial["for_whom"].startswith("Предприятиям")
+    assert card.meta["keys_repaired"] == ["seo_description", "commercial.for_whom"]
+
+
+def _claim_id(card_reply, text):
+    from app.generator import collect_statements, normalize
+    return collect_statements(normalize(card_reply)).index(text) + 1
+
+
+def test_verifier_finds_claim_and_model_fixes_it(manometer):
+    bad_point = "Корпус из стали устойчив к коррозии"
+    first = good_reply(manometer)
+    first["commercial"]["selling_points"] = ["Класс точности 1,5 и корпус 100 мм", bad_point]
+    fixed = good_reply(manometer)
+    verdict = {"unsupported": [{"id": _claim_id(first, bad_point), "reason": "о коррозии в данных нет"}]}
+    client = FakeClient(first, verdict, fixed, {"unsupported": []})
+    card = generate_card(manometer, client, verify=True)
+    assert len(client.calls) == 4
+    assert "устойчив к коррозии" in client.calls[2][-1]["content"]  # просьба исправить
+    assert bad_point not in card.commercial["selling_points"]
+    assert card.warnings == []
+    assert card.meta["claims_check"][0]["unsupported"] == {bad_point: "о коррозии в данных нет"}
+    assert card.meta["claims_check"][1]["unsupported"] == {}
+
+
+def test_verifier_claim_is_removed_if_model_insists(manometer):
+    bad_point = "Корпус из стали устойчив к коррозии"
+    reply = good_reply(manometer)
+    reply["commercial"]["selling_points"] = [bad_point]
+    verdict = {"unsupported": [{"id": _claim_id(reply, bad_point), "reason": "о коррозии в данных нет"}]}
+    card = generate_card(manometer, FakeClient(reply, verdict, reply, verdict), verify=True)
+    assert card.commercial["selling_points"] == []
+    assert any("не подтверждается данными: о коррозии в данных нет" in w for w in card.warnings)
+
+
+def test_verifier_failure_does_not_break_card(manometer):
+    card = generate_card(manometer, FakeClient(good_reply(manometer), "не JSON"), verify=True)
+    assert card.seo_description
+    assert any("Проверка утверждений моделью не выполнена" in w for w in card.warnings)
