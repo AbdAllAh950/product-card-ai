@@ -79,6 +79,27 @@ def _items(value) -> list[str]:
     return [s for s in (_one_line(v) for v in value) if s]
 
 
+EXPECTED_KEYS = ("seo_title", "seo_description", "search_queries", "commercial")
+
+# Служебные фразы об отсутствии данных уместны в missing_or_unclear, но не в тексте для покупателя.
+META_RE = re.compile(
+    r"(?:\bв|\bво) (?:исходных |предоставленных |имеющихся |этих )?данных|данных нет|"
+    r"сведени\w* (?:нет|отсутству)|не указан\w* в данных",
+    re.IGNORECASE,
+)
+
+
+def unwrap(data: dict) -> dict:
+    """Некоторые модели оборачивают ответ: {"card": {...}}. Достаём вложенный объект."""
+    if any(k in data for k in EXPECTED_KEYS):
+        return data
+    for value in data.values():
+        if isinstance(value, dict) and any(k in value for k in EXPECTED_KEYS):
+            return value
+    keys = ", ".join(list(data)[:8]) or "нет"
+    raise ValueError(f"нет ключей seo_title, seo_description, search_queries, commercial; получены ключи: {keys}")
+
+
 def normalize(data: dict) -> dict:
     commercial = data.get("commercial") if isinstance(data.get("commercial"), dict) else {}
     description = data.get("seo_description") if isinstance(data.get("seo_description"), str) else ""
@@ -127,6 +148,11 @@ def find_problems(card: dict, source: str, sparse: bool = False) -> list[str]:
         )
     elif desc_len > DESCRIPTION_MAX:
         problems.append(f"seo_description — {desc_len} символов, нужно {DESCRIPTION_MIN}–{DESCRIPTION_MAX}. Сократи, убрав повторы.")
+    if META_RE.search(card["seo_description"]):
+        problems.append(
+            "seo_description: текст для покупателя не должен сообщать об отсутствии данных — "
+            "убери такие фразы, недостающее перечисли в missing_or_unclear."
+        )
 
     count = len(card["search_queries"])
     if not QUERIES_MIN <= count <= QUERIES_MAX:
@@ -185,6 +211,8 @@ def enforce(card: dict, product: Product, warnings: list[str]) -> dict:
         for sentence in sentences:
             if _unverified(sentence, source):
                 warnings.append(f"Из описания удалена фраза с данными, которых нет во входных: «{sentence}»")
+            elif META_RE.search(sentence):
+                warnings.append(f"Из описания удалена служебная фраза об отсутствии данных: «{sentence}»")
             else:
                 kept.append(sentence)
         if kept:
@@ -245,25 +273,30 @@ def _clarifications(product_issues: list[str], model_items: list[str]) -> list[s
     return out
 
 
-def generate_card(product: Product, client: ChatClient, max_repairs: int = MAX_REPAIRS) -> Card:
+def generate_card(
+    product: Product, client: ChatClient, max_repairs: int = MAX_REPAIRS, keep_raw: bool = False
+) -> Card:
     source = product.source_text()
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": build_user_prompt(product)},
     ]
-    card: dict | None = None
-    problems: list[str] = []
+    best: tuple[dict, list[str]] | None = None  # ответ с наименьшим числом проблем
     repair_log: list[list[str]] = []
+    raw_replies: list[str] = []
     attempts = 0
 
     for attempt in range(max_repairs + 1):
         attempts += 1
         reply = client.chat(messages)
+        raw_replies.append(reply[:4000])
         try:
-            card = normalize(parse_json_reply(reply))
+            card = normalize(unwrap(parse_json_reply(reply)))
             problems = find_problems(card, source, sparse=product.is_sparse)
+            if best is None or len(problems) < len(best[1]):
+                best = (card, problems)
         except ValueError as exc:  # json.JSONDecodeError — подкласс ValueError
-            problems = [f"Ответ не является корректным JSON ({exc}). Верни только JSON-объект по схеме."]
+            problems = [f"Ответ не соответствует формату ({exc}). Верни только JSON-объект строго по схеме."]
         repair_log.append(problems)
         if not problems:
             break
@@ -273,11 +306,12 @@ def generate_card(product: Product, client: ChatClient, max_repairs: int = MAX_R
                 {"role": "user", "content": build_repair_prompt(problems)},
             ]
 
-    if card is None:
-        raise GenerationError(f"Модель не вернула корректный JSON за {attempts} попыток.")
+    if best is None:
+        raise GenerationError(f"Модель не вернула корректный JSON по схеме за {attempts} попыток.")
 
     warnings: list[str] = []
-    card = enforce(card, product, warnings)
+    card = enforce(best[0], product, warnings)
+    extra_meta = {"raw_replies": raw_replies} if keep_raw else {}
 
     return Card(
         name=product.name,
@@ -298,5 +332,6 @@ def generate_card(product: Product, client: ChatClient, max_repairs: int = MAX_R
             "title_length": len(card["seo_title"]),
             "description_length": len(card["seo_description"]),
             **{k: v for k, v in product.extra.items()},
+            **extra_meta,
         },
     )

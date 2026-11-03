@@ -22,6 +22,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("inputs", nargs="+", help="JSON-файлы с данными о товарах")
     parser.add_argument("--format", choices=["md", "json"], default="md", help="формат вывода в консоль")
     parser.add_argument("--out", help="папка, куда сохранить <имя>.md и <имя>.json")
+    parser.add_argument("--save-raw", action="store_true", help="сохранить сырые ответы модели в meta.raw_replies (отладка)")
     args = parser.parse_args(argv)
 
     client = None
@@ -36,7 +37,7 @@ def main(argv: list[str] | None = None) -> int:
             continue
         try:
             client = client or make_client()
-            card = card_from_json(raw, client)
+            card = card_from_json(raw, client, keep_raw=args.save_raw)
         except InputError as exc:
             print(f"[{path}] ошибка входных данных: {exc}", file=sys.stderr)
             exit_code = 2

@@ -56,7 +56,7 @@ def test_persistent_invention_is_removed_with_warning(manometer):
 def test_bad_json_then_good(manometer):
     client = FakeClient("Конечно! Вот карточка: ...", good_reply(manometer))
     card = generate_card(manometer, client)
-    assert "корректным JSON" in client.calls[1][-1]["content"]
+    assert "не соответствует формату" in client.calls[1][-1]["content"]
     assert card.warnings == []
 
 
@@ -146,3 +146,40 @@ def test_rich_product_short_description_is_repaired(manometer):
     card = generate_card(manometer, client)
     assert "seo_description" in client.calls[1][-1]["content"]
     assert len(card.meta["checks_per_attempt"]) == 2 and card.meta["checks_per_attempt"][1] == []
+
+
+def test_wrapped_reply_is_unwrapped(manometer):
+    card = generate_card(manometer, FakeClient({"card": good_reply(manometer)}))
+    assert card.seo_title.startswith("Манометр") and card.warnings == []
+
+
+def test_wrong_keys_are_reported_to_model(manometer):
+    client = FakeClient({"заголовок": "x", "описание": "y"}, good_reply(manometer))
+    card = generate_card(manometer, client)
+    assert "получены ключи: заголовок, описание" in client.calls[1][-1]["content"]
+    assert card.warnings == []
+
+
+def test_best_attempt_is_kept(manometer):
+    # первый ответ почти хороший (одна проблема), следующие — пустые: в карточку идёт первый
+    worse = {"seo_title": "", "seo_description": "", "search_queries": [], "commercial": {}}
+    client = FakeClient(good_reply(manometer, seo_title="Манометр 16 бар"), worse, worse)
+    card = generate_card(manometer, client)
+    assert card.seo_description and len(card.search_queries) == 3
+    assert card.seo_title == manometer.name  # заголовок с «16» заменён названием товара
+
+
+def test_meta_phrases_are_removed_from_description(manometer):
+    reply = good_reply(manometer)
+    reply["seo_description"] += " В исходных данных нет сведений о гарантии."
+    card = generate_card(manometer, FakeClient(reply))
+    assert "исходных данных" not in card.seo_description
+    assert any("служебная фраза" in w or "непроверенн" in w or "которых нет" in w for w in card.warnings)
+
+
+def test_unsupported_evaluations_are_flagged(manometer):
+    reply = good_reply(manometer)
+    reply["commercial"]["selling_points"] = ["Долговечный корпус и высокая точность"]
+    card = generate_card(manometer, FakeClient(reply))
+    assert card.commercial["selling_points"] == []
+    assert any("удалён пункт" in w for w in card.warnings)

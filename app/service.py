@@ -10,6 +10,6 @@ def make_client() -> LLMClient:
     return LLMClient(get_settings())
 
 
-def card_from_json(raw: str | bytes | dict, client=None) -> Card:
+def card_from_json(raw: str | bytes | dict, client=None, keep_raw: bool = False) -> Card:
     product = parse_product(raw)  # InputError — до обращения к модели
-    return generate_card(product, client or make_client())
+    return generate_card(product, client or make_client(), keep_raw=keep_raw)
