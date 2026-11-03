@@ -231,6 +231,21 @@ def _cut_sentences(text: str, limit: int) -> str:
     return head[: end + 1] if end > limit // 2 else _cut_words(text, limit)
 
 
+_WORD_RE = re.compile(r"[а-яёa-z]{4,}", re.IGNORECASE)
+LEXICAL_SUPPORT_MIN = 0.8
+
+
+def _stems(text: str) -> set[str]:
+    """Грубая основа слова для русского текста: первые 5 букв слов длиной от 4 букв."""
+    return {w.lower()[:5] for w in _WORD_RE.findall(text)}
+
+
+def lexical_support(statement: str, source: str) -> float:
+    """Доля значимых слов утверждения, основы которых встречаются во входных данных."""
+    words = _stems(statement)
+    return len(words & _stems(source)) / len(words) if words else 1.0
+
+
 def _sentences(paragraph: str) -> list[str]:
     return [s for s in re.split(r"(?<=[.!?…])\s+", paragraph) if s.strip()]
 
@@ -261,6 +276,7 @@ def verify_statements(product: Product, card: dict, client: "ChatClient") -> tup
     except (LLMError, ValueError) as exc:
         return {}, f"Проверка утверждений моделью не выполнена ({exc}); проверьте блок для менеджера вручную."
     found: dict[str, str] = {}
+    source = product.source_text()
     items = data.get("unsupported", [])
     for item in items if isinstance(items, list) else []:
         raw_id = item.get("id") if isinstance(item, dict) else item
@@ -269,8 +285,14 @@ def verify_statements(product: Product, card: dict, client: "ChatClient") -> tup
             idx = int(raw_id)
         except (TypeError, ValueError):
             continue
-        if 1 <= idx <= len(statements):
-            found[statements[idx - 1]] = reason
+        if not 1 <= idx <= len(statements):
+            continue
+        statement = statements[idx - 1]
+        # Фактчекер тоже ошибается: на реальных ответах он помечал дословные цитаты из описания.
+        # Учитываем отметку, только если есть конкретная причина и утверждение заметно расходится
+        # с лексикой исходных данных.
+        if reason and lexical_support(statement, source) < LEXICAL_SUPPORT_MIN:
+            found[statement] = reason
     return found, None
 
 

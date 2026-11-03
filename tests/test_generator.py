@@ -233,3 +233,16 @@ def test_verifier_failure_does_not_break_card(manometer):
     card = generate_card(manometer, FakeClient(good_reply(manometer), "не JSON"), verify=True)
     assert card.seo_description
     assert any("Проверка утверждений моделью не выполнена" in w for w in card.warnings)
+
+
+def test_verifier_false_positives_are_ignored(manometer):
+    reply = good_reply(manometer)
+    quote = reply["commercial"]["for_whom"]  # почти дословно из описания
+    verdict = {"unsupported": [
+        {"id": _claim_id(reply, quote), "reason": "нет в данных"},           # цитата — игнорируем
+        {"id": _claim_id(reply, reply["commercial"]["tasks"][0]), "reason": ""},  # без причины — игнорируем
+    ]}
+    client = FakeClient(reply, verdict)
+    card = generate_card(manometer, client, verify=True)
+    assert len(client.calls) == 2  # исправлять нечего
+    assert card.commercial["for_whom"] == quote and card.warnings == []
