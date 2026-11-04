@@ -4,14 +4,21 @@
 #   bash scripts/run_local.sh                    # Qwen2.5 3B: подходит и для 8 ГБ ОЗУ
 #   MODEL=qwen2.5:7b bash scripts/run_local.sh   # любая другая модель Ollama
 #
-# Что делает: ставит Ollama без Homebrew (из GitHub Releases), запускает сервер, скачивает модель
-# (сначала с зеркала ModelScope, затем из реестра Ollama), создаёт копию модели с контекстом 16K,
-# генерирует карточки для examples/input/*.json в examples/output-local/ и сравнивает их
-# с карточками облачной модели из examples/output/.
+# Что делает: ставит Ollama без Homebrew (из GitHub Releases), запускает сервер, скачивает GGUF-файл
+# модели обычным HTTPS (ModelScope, затем Hugging Face, затем реестр Ollama — что доступно из вашей
+# сети), регистрирует её в Ollama с контекстом 16K, генерирует карточки для examples/input/*.json
+# в examples/output-local/ и сравнивает их с карточками облачной модели из examples/output/.
+# Весь вывод дублируется в run_local.log.
 set -u
 cd "$(dirname "$0")/.."
+exec > >(tee -a run_local.log) 2>&1
+echo "=== $(date '+%Y-%m-%d %H:%M:%S') ==="
 
 CTX=16384
+GGUF_NAME=qwen2.5-3b-instruct-q4_k_m.gguf
+GGUF_URLS="https://modelscope.cn/models/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/master/$GGUF_NAME
+https://huggingface.co/Qwen/Qwen2.5-3B-Instruct-GGUF/resolve/main/$GGUF_NAME"
+GGUF_DIR="$HOME/.cache/product-card-ai"
 REL=https://github.com/ollama/ollama/releases/latest/download
 export NO_PROXY="localhost,127.0.0.1${NO_PROXY:+,$NO_PROXY}" no_proxy="localhost,127.0.0.1${no_proxy:+,$no_proxy}"
 
@@ -89,26 +96,62 @@ pull_watch() {  # ollama pull, который сдаётся, если загр�
   wait "$pid"
 }
 
+gguf_ok() {  # файл целиком: сигнатура GGUF и размер больше 1,8 ГБ
+  [ -f "$1" ] && [ "$(head -c 4 "$1")" = "GGUF" ] && [ "$(stat -f %z "$1")" -gt 1800000000 ]
+}
+
+download_gguf() {  # докачивает файл с первого доступного источника; прерывает зависшие загрузки
+  local url file="$GGUF_DIR/$GGUF_NAME"
+  mkdir -p "$GGUF_DIR"
+  gguf_ok "$file" && return 0
+  for url in $GGUF_URLS; do
+    say "Скачиваю модель (~2 ГБ): $url"
+    curl -fL -C - --retry 2 --connect-timeout 20 --speed-limit 1024 --speed-time 60 \
+         --progress-bar -o "$file" "$url" && gguf_ok "$file" && return 0
+    [ "$(head -c 4 "$file" 2>/dev/null)" = "GGUF" ] || rm -f "$file"  # не файл модели — не докачиваем к нему
+    printf 'Источник недоступен или загрузка зависла — пробую следующий.\n'
+  done
+  return 1
+}
+
+create_from_gguf() {  # $1 — имя модели в Ollama, $2 — путь к .gguf; шаблон чата Qwen (ChatML)
+  local mf="${TMPDIR:-/tmp}/Modelfile.product-card"
+  printf 'FROM %s\nPARAMETER num_ctx %s\nPARAMETER stop "<|im_end|>"\n' "$2" "$CTX" >"$mf"
+  cat >>"$mf" <<'EOF'
+TEMPLATE """{{- range .Messages }}<|im_start|>{{ .Role }}
+{{ .Content }}<|im_end|>
+{{ end }}<|im_start|>assistant
+"""
+EOF
+  "$OLLAMA" create "$1" -f "$mf"
+}
+
+create_ctx_copy() {  # $1 — новое имя, $2 — модель из реестра Ollama
+  local mf="${TMPDIR:-/tmp}/Modelfile.product-card"
+  printf 'FROM %s\nPARAMETER num_ctx %s\n' "$2" "$CTX" >"$mf"
+  "$OLLAMA" create "$1" -f "$mf"
+}
+
+# По умолчанию Ollama держит короткий контекст: длинный промпт обрезается с начала и теряется
+# системная инструкция. Поэтому модель регистрируется с контекстом 16K.
 if [ -n "${MODEL:-}" ]; then
-  BASE=$MODEL
-  have_model "$BASE" || pull_watch "$BASE" || die "Не удалось скачать $BASE."
+  LOCAL="$(printf '%s' "${MODEL##*/}" | tr ':/' '--' | tr '[:upper:]' '[:lower:]')-ctx16k"
+  have_model "$MODEL" || pull_watch "$MODEL" || die "Не удалось скачать $MODEL."
+  create_ctx_copy "$LOCAL" "$MODEL" >/dev/null || die "ollama create не сработал."
 else
-  MIRROR=modelscope.cn/Qwen/Qwen2.5-3B-Instruct-GGUF:Q4_K_M  # зеркало ModelScope, обычно доступно из РФ
-  REGISTRY=qwen2.5:3b                                        # официальный реестр Ollama
-  if have_model "$REGISTRY"; then BASE=$REGISTRY
-  elif have_model "$MIRROR"; then BASE=$MIRROR
-  elif pull_watch "$MIRROR"; then BASE=$MIRROR
-  elif pull_watch "$REGISTRY"; then BASE=$REGISTRY
-  else die "Модель не скачалась ни с ModelScope, ни из реестра Ollama. Включите VPN и запустите скрипт снова (скачанное не потеряется)."
+  LOCAL=qwen2.5-3b-ctx16k
+  if have_model "$LOCAL"; then
+    say "Модель $LOCAL уже есть"
+  elif download_gguf; then
+    say "Регистрирую модель в Ollama как $LOCAL"
+    create_from_gguf "$LOCAL" "$GGUF_DIR/$GGUF_NAME" || die "ollama create не сработал."
+    rm -f "$GGUF_DIR/$GGUF_NAME"  # Ollama хранит свою копию, второй файл на 2 ГБ не нужен
+  elif pull_watch qwen2.5:3b; then
+    create_ctx_copy "$LOCAL" qwen2.5:3b >/dev/null || die "ollama create не сработал."
+  else
+    die "Модель не скачалась ни с ModelScope, ни с Hugging Face, ни из реестра Ollama. Включите VPN и запустите скрипт снова: скачанная часть файла не потеряется."
   fi
 fi
-
-# По умолчанию Ollama держит короткий контекст; длинный промпт обрезается с начала и теряется
-# системная инструкция. Поэтому делаем копию модели с контекстом 16K.
-LOCAL="$(printf '%s' "${BASE##*/}" | tr ':/' '--' | tr '[:upper:]' '[:lower:]')-ctx16k"
-say "Готовлю $LOCAL (на базе $BASE, контекст $CTX токенов)"
-printf 'FROM %s\nPARAMETER num_ctx %s\n' "$BASE" "$CTX" >"${TMPDIR:-/tmp}/Modelfile.product-card"
-"$OLLAMA" create "$LOCAL" -f "${TMPDIR:-/tmp}/Modelfile.product-card" >/dev/null || die "ollama create не сработал."
 
 # --- 4. Генерация ---------------------------------------------------------------------------
 PY=.venv/bin/python
